@@ -22,6 +22,44 @@
 #include "MapUtils.h"
 #include "World.h"
 
+namespace
+{
+constexpr int32 SkyridingOverrideRecordId = 2106;
+constexpr int32 SkyridingOverrideSourceRecordId = 2106;
+constexpr int32 SkyridingOverrideHotfixPushId = 108362;
+constexpr uint32 SkyridingOverrideHotfixUniqueId = 4282830033;
+constexpr uint32 SkyridingOverrideSpellDataTableHash = 3396722460;
+
+bool IsSkyridingOverrideHotfix(DB2Manager::HotfixRecord const& hotfixRecord)
+{
+    return hotfixRecord.RecordID == SkyridingOverrideRecordId || hotfixRecord.ID.PushID == SkyridingOverrideHotfixPushId;
+}
+
+bool HasSkyridingOverrideHotfix(DB2Manager::HotfixPush const& push)
+{
+    for (DB2Manager::HotfixRecord const& hotfixRecord : push.Records)
+        if (IsSkyridingOverrideHotfix(hotfixRecord))
+            return true;
+
+    return false;
+}
+
+bool TryWriteSkyridingOverrideBlob(uint32 tableHash, int32 recordId, LocaleConstant locale, ByteBuffer& data, uint32& size)
+{
+    if (tableHash != SkyridingOverrideSpellDataTableHash || recordId != SkyridingOverrideRecordId)
+        return false;
+
+    if (std::vector<uint8> const* blobData = sDB2Manager.GetHotfixBlobData(tableHash, recordId, locale))
+    {
+        size = uint32(blobData->size());
+        data.append(blobData->data(), blobData->size());
+        return true;
+    }
+
+    return false;
+}
+}
+
 void WorldSession::HandleDBQueryBulk(WorldPackets::Hotfix::DBQueryBulk& dbQuery)
 {
     DB2StorageBase const* store = sDB2Manager.GetStorage(dbQuery.TableHash);
@@ -31,13 +69,25 @@ void WorldSession::HandleDBQueryBulk(WorldPackets::Hotfix::DBQueryBulk& dbQuery)
         dbReply.TableHash = dbQuery.TableHash;
         dbReply.RecordID = record.RecordID;
 
-        if (store && store->HasRecord(record.RecordID))
+        if (record.RecordID == SkyridingOverrideRecordId)
+            TC_LOG_INFO("server", "SkyridingHotfix: db-query-bulk player={} tableHash={} recordId={} sourceRecordId={} hasStore={} hasRecord={} hasSourceRecord={}",
+                GetPlayerInfo(), dbQuery.TableHash, record.RecordID, SkyridingOverrideSourceRecordId,
+                store != nullptr, store && store->HasRecord(record.RecordID), store && store->HasRecord(SkyridingOverrideSourceRecordId));
+
+        uint32 skyridingBlobSize = 0;
+        if (TryWriteSkyridingOverrideBlob(dbQuery.TableHash, record.RecordID, GetSessionDbcLocale(), dbReply.Data, skyridingBlobSize))
         {
             dbReply.Status = DB2Manager::HotfixRecord::Status::Valid;
             dbReply.Timestamp = GameTime::GetGameTime();
-            store->WriteRecord(record.RecordID, GetSessionDbcLocale(), dbReply.Data);
+        }
+        else if (store && (store->HasRecord(record.RecordID) || (record.RecordID == SkyridingOverrideRecordId && store->HasRecord(SkyridingOverrideSourceRecordId))))
+        {
+            uint32 recordIdToWrite = record.RecordID == SkyridingOverrideRecordId && !store->HasRecord(record.RecordID) ? SkyridingOverrideSourceRecordId : record.RecordID;
+            dbReply.Status = DB2Manager::HotfixRecord::Status::Valid;
+            dbReply.Timestamp = GameTime::GetGameTime();
+            store->WriteRecord(recordIdToWrite, GetSessionDbcLocale(), dbReply.Data);
 
-            if (std::vector<DB2Manager::HotfixOptionalData> const* optionalDataEntries = sDB2Manager.GetHotfixOptionalData(dbQuery.TableHash, record.RecordID, GetSessionDbcLocale()))
+            if (std::vector<DB2Manager::HotfixOptionalData> const* optionalDataEntries = sDB2Manager.GetHotfixOptionalData(dbQuery.TableHash, recordIdToWrite, GetSessionDbcLocale()))
             {
                 for (DB2Manager::HotfixOptionalData const& optionalData : *optionalDataEntries)
                 {
@@ -67,6 +117,10 @@ void WorldSession::SendAvailableHotfixes()
             continue;
 
         availableHotfixes.Hotfixes.insert(push.Records.front().ID);
+
+        if (HasSkyridingOverrideHotfix(push))
+            TC_LOG_INFO("server", "SkyridingHotfix: available player={} locale={} advertisedPushId={} advertisedUniqueId={} records={}",
+                GetPlayerInfo(), uint32(GetSessionDbcLocale()), push.Records.front().ID.PushID, push.Records.front().ID.UniqueID, push.Records.size());
     }
 
     SendPacket(availableHotfixes.Write());
@@ -79,6 +133,10 @@ void WorldSession::HandleHotfixRequest(WorldPackets::Hotfix::HotfixRequest& hotf
     hotfixQueryResponse.Hotfixes.reserve(hotfixQuery.Hotfixes.size());
     for (int32 hotfixId : hotfixQuery.Hotfixes)
     {
+        if (hotfixId == SkyridingOverrideHotfixPushId)
+            TC_LOG_INFO("server", "SkyridingHotfix: request player={} pushId={} expectedUniqueId={}",
+                GetPlayerInfo(), hotfixId, SkyridingOverrideHotfixUniqueId);
+
         if (DB2Manager::HotfixPush const* hotfixRecords = Trinity::Containers::MapGetValuePtr(hotfixes, hotfixId))
         {
             for (DB2Manager::HotfixRecord const& hotfixRecord : hotfixRecords->Records)
@@ -91,12 +149,17 @@ void WorldSession::HandleHotfixRequest(WorldPackets::Hotfix::HotfixRequest& hotf
                 if (hotfixRecord.HotfixStatus == DB2Manager::HotfixRecord::Status::Valid)
                 {
                     DB2StorageBase const* storage = sDB2Manager.GetStorage(hotfixRecord.TableHash);
-                    if (storage && storage->HasRecord(uint32(hotfixRecord.RecordID)))
+                    uint32 recordIdToWrite = uint32(hotfixRecord.RecordID);
+                    if (IsSkyridingOverrideHotfix(hotfixRecord) && storage && !storage->HasRecord(recordIdToWrite) && storage->HasRecord(SkyridingOverrideSourceRecordId))
+                        recordIdToWrite = SkyridingOverrideSourceRecordId;
+
+                    bool wroteSkyridingOverrideBlob = TryWriteSkyridingOverrideBlob(hotfixRecord.TableHash, hotfixRecord.RecordID, GetSessionDbcLocale(), hotfixQueryResponse.HotfixContent, hotfixData.Size);
+                    if (!wroteSkyridingOverrideBlob && storage && storage->HasRecord(recordIdToWrite))
                     {
                         std::size_t pos = hotfixQueryResponse.HotfixContent.size();
-                        storage->WriteRecord(uint32(hotfixRecord.RecordID), GetSessionDbcLocale(), hotfixQueryResponse.HotfixContent);
+                        storage->WriteRecord(recordIdToWrite, GetSessionDbcLocale(), hotfixQueryResponse.HotfixContent);
 
-                        if (std::vector<DB2Manager::HotfixOptionalData> const* optionalDataEntries = sDB2Manager.GetHotfixOptionalData(hotfixRecord.TableHash, hotfixRecord.RecordID, GetSessionDbcLocale()))
+                        if (std::vector<DB2Manager::HotfixOptionalData> const* optionalDataEntries = sDB2Manager.GetHotfixOptionalData(hotfixRecord.TableHash, recordIdToWrite, GetSessionDbcLocale()))
                         {
                             for (DB2Manager::HotfixOptionalData const& optionalData : *optionalDataEntries)
                             {
@@ -107,15 +170,25 @@ void WorldSession::HandleHotfixRequest(WorldPackets::Hotfix::HotfixRequest& hotf
 
                         hotfixData.Size = hotfixQueryResponse.HotfixContent.size() - pos;
                     }
-                    else if (std::vector<uint8> const* blobData = sDB2Manager.GetHotfixBlobData(hotfixRecord.TableHash, hotfixRecord.RecordID, GetSessionDbcLocale()))
+                    else if (!wroteSkyridingOverrideBlob)
                     {
-                        hotfixData.Size = blobData->size();
-                        hotfixQueryResponse.HotfixContent.append(blobData->data(), blobData->size());
+                        if (std::vector<uint8> const* blobData = sDB2Manager.GetHotfixBlobData(hotfixRecord.TableHash, hotfixRecord.RecordID, GetSessionDbcLocale()))
+                        {
+                            hotfixData.Size = blobData->size();
+                            hotfixQueryResponse.HotfixContent.append(blobData->data(), blobData->size());
+                        }
+                        else
+                            // Do not send Status::Valid when we don't have a hotfix blob for current locale
+                            hotfixData.Record.HotfixStatus = storage ? DB2Manager::HotfixRecord::Status::RecordRemoved : DB2Manager::HotfixRecord::Status::Invalid;
                     }
-                    else
-                        // Do not send Status::Valid when we don't have a hotfix blob for current locale
-                        hotfixData.Record.HotfixStatus = storage ? DB2Manager::HotfixRecord::Status::RecordRemoved : DB2Manager::HotfixRecord::Status::Invalid;
                 }
+
+                if (IsSkyridingOverrideHotfix(hotfixRecord))
+                    TC_LOG_INFO("server", "SkyridingHotfix: response-record player={} pushId={} uniqueId={} tableHash={} recordId={} sourceRecordId={} status={} size={} finalStatus={} hasStorage={} hasSourceRecord={}",
+                        GetPlayerInfo(), hotfixRecord.ID.PushID, hotfixRecord.ID.UniqueID, hotfixRecord.TableHash, hotfixRecord.RecordID,
+                        SkyridingOverrideSourceRecordId, uint32(hotfixRecord.HotfixStatus), hotfixData.Size, uint32(hotfixData.Record.HotfixStatus),
+                        sDB2Manager.GetStorage(hotfixRecord.TableHash) != nullptr,
+                        sDB2Manager.GetStorage(hotfixRecord.TableHash) && sDB2Manager.GetStorage(hotfixRecord.TableHash)->HasRecord(SkyridingOverrideSourceRecordId));
             }
         }
     }
