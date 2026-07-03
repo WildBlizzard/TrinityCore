@@ -16,8 +16,10 @@
  */
 
 #include "ScriptMgr.h"
+#include "AreaTrigger.h"
 #include "Log.h"
 #include "DB2Stores.h"
+#include "MovementPackets.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "Position.h"
@@ -34,6 +36,7 @@
 #include <shared_mutex>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace
 {
@@ -57,10 +60,13 @@ enum SkyridingSpells : uint32
 constexpr uint32 SkyridingOverrideSpellDataId = 2106;
 constexpr uint32 SkyridingFlightCapabilityId = 1;
 constexpr uint32 SkyridingCleanupIntervalMs = 1000;
-constexpr float SkyridingMovingForwardVelocity = 5.0f;
 constexpr float SkyridingAscentGroundHorizontalSpeed = 28.0f;
 constexpr float SkyridingAscentGroundVerticalSpeed = 58.0f;
 constexpr float SkyridingAscentFlyingVerticalSpeed = 44.0f;
+constexpr float SkyridingForwardSurgeSpeedBonus = 36.0f;
+constexpr float SkyridingWhirlingSurgeSpeedBonus = 64.0f;
+constexpr float SkyridingPitchVerticalVelocityScale = 0.55f;
+constexpr uint32 SkyridingImpulseMovementForceDurationMs = 350;
 
 std::array<uint32, 5> constexpr SkyridingTemporarySpells =
 {
@@ -81,6 +87,15 @@ std::array<uint32, 4> constexpr SkyridingSecondWindTargets =
 
 std::unordered_set<ObjectGuid> SkyridingPreferredPlayers;
 std::unordered_set<ObjectGuid> SkyridingActionBarLoggedPlayers;
+
+struct SkyridingMovementForce
+{
+    ObjectGuid PlayerGuid;
+    ObjectGuid ForceGuid;
+    uint32 RemainingMs;
+};
+
+std::vector<SkyridingMovementForce> SkyridingMovementForces;
 
 bool IsSkyridingEnabled(Player const* player)
 {
@@ -118,6 +133,23 @@ void SetSkyridingPreferred(Player* player, bool preferred)
         SkyridingPreferredPlayers.erase(player->GetGUID());
 
     LogSkyridingState(player, preferred ? "preference-set-skyriding" : "preference-set-stable");
+}
+
+void RemoveSkyridingMovementForces(Player* player)
+{
+    if (!player)
+        return;
+
+    for (auto itr = SkyridingMovementForces.begin(); itr != SkyridingMovementForces.end();)
+    {
+        if (itr->PlayerGuid == player->GetGUID())
+        {
+            player->RemoveMovementForce(itr->ForceGuid);
+            itr = SkyridingMovementForces.erase(itr);
+        }
+        else
+            ++itr;
+    }
 }
 
 void RestoreSkyridingPreferred(Player* player, bool preferred)
@@ -201,6 +233,7 @@ void SetSkyridingTemporarySpells(Player* player, bool apply)
 void DisableSkyriding(Player* player, bool restoreNormalFlight, bool preserveFlightStyle = false)
 {
     LogSkyridingState(player, restoreNormalFlight ? "disable-begin-restore-normal-flight" : "disable-begin-cleanup");
+    RemoveSkyridingMovementForces(player);
     player->RemoveAurasDueToSpell(SPELL_SKYRIDING_KEYBOUND_AURA);
     if (!preserveFlightStyle)
         player->RemoveAurasDueToSpell(SPELL_FLIGHT_STYLE_SKYRIDING);
@@ -284,7 +317,7 @@ void EnsureSkyridingActionBar(Player* player)
         LogSkyridingActionBarState(player, needsHeal ? "actionbar-heal" : "actionbar-ensure", int32(SkyridingOverrideSpellDataId));
 }
 
-SpellCastResult CheckCanUseSkyriding(Player const* player)
+SpellCastResult CheckCanUseSkyriding(Player const* player, bool allowGroundTakeoff = false)
 {
     if (!player->IsMounted())
     {
@@ -298,57 +331,144 @@ SpellCastResult CheckCanUseSkyriding(Player const* player)
         return SPELL_FAILED_NOT_FLYING;
     }
 
+    if (!allowGroundTakeoff && !IsPlayerAdvFlying(player))
+    {
+        LogSkyridingState(player, "active-spell-check-failed", "not-adv-flying");
+        return SPELL_FAILED_NOT_FLYING;
+    }
+
     LogSkyridingState(player, "active-spell-check-ok");
     return SPELL_FAILED_SUCCESS;
 }
 
-void SendSkyridingImpulse(Player* player, float horizontalSpeed, float verticalSpeed)
+float GetCurrentAdvFlyingForwardSpeed(Player const* player)
+{
+    if (!IsPlayerAdvFlying(player))
+        return 0.0f;
+
+    return std::fabs(player->m_movementInfo.advFlying->forwardVelocity);
+}
+
+float GetCurrentAdvFlyingUpVelocity(Player const* player)
+{
+    if (!IsPlayerAdvFlying(player))
+        return 0.0f;
+
+    return player->m_movementInfo.advFlying->upVelocity;
+}
+
+float GetCurrentMovementPitch(Player const* player)
+{
+    float const pitch = player->m_movementInfo.pitch;
+    return std::isfinite(pitch) ? pitch : 0.0f;
+}
+
+void SendSkyridingKnockbackImpulse(Player* player, float horizontalSpeed, float verticalSpeed)
+{
+    float const unitOrientation = player->GetOrientation();
+    float const movementOrientation = player->m_movementInfo.pos.GetOrientation();
+    float const orientation = std::isfinite(movementOrientation) ? movementOrientation : unitOrientation;
+    float const angle = Position::NormalizeOrientation(orientation - unitOrientation);
+
+    TC_LOG_INFO("server", "Skyriding: impulse player={} guid={} horizontalSpeed={} verticalSpeed={} unitOrientation={} movementOrientation={} usedOrientation={} angle={}",
+        player->GetName(), player->GetGUID().ToString(), horizontalSpeed, verticalSpeed, unitOrientation, movementOrientation, orientation, angle);
+
+    player->KnockbackFrom(player->GetPosition(), horizontalSpeed, verticalSpeed, angle);
+}
+
+void SendSkyridingHorizontalMovementForce(Player* player, float horizontalSpeed, char const* source)
 {
     float const unitOrientation = player->GetOrientation();
     float const movementOrientation = player->m_movementInfo.pos.GetOrientation();
     float const orientation = std::isfinite(movementOrientation) ? movementOrientation : unitOrientation;
 
-    TC_LOG_INFO("server", "Skyriding: impulse player={} guid={} horizontalSpeed={} verticalSpeed={} unitOrientation={} movementOrientation={} usedOrientation={}",
-        player->GetName(), player->GetGUID().ToString(), horizontalSpeed, verticalSpeed, unitOrientation, movementOrientation, orientation);
+    if (horizontalSpeed <= 0.0f)
+        return;
 
-    Position origin = player->GetPosition();
-    origin.Relocate(origin.GetPositionX() - std::cos(orientation), origin.GetPositionY() - std::sin(orientation), origin.GetPositionZ(), orientation);
-    player->KnockbackFrom(origin, horizontalSpeed, verticalSpeed);
+    RemoveSkyridingMovementForces(player);
+
+    Position direction(std::cos(orientation), std::sin(orientation), 0.0f);
+    ObjectGuid const forceGuid = AreaTrigger::CreateNewMovementForceId(player->GetMap(), 0);
+
+    TC_LOG_INFO("server", "Skyriding: movement-force player={} guid={} forceGuid={} source={} horizontalSpeed={} magnitude={} unitOrientation={} movementOrientation={} usedOrientation={} directionX={} directionY={} directionZ={} durationMs={}",
+        player->GetName(), player->GetGUID().ToString(), forceGuid.ToString(), source, horizontalSpeed, horizontalSpeed, unitOrientation, movementOrientation, orientation,
+        direction.GetPositionX(), direction.GetPositionY(), direction.GetPositionZ(), SkyridingImpulseMovementForceDurationMs);
+
+    player->ApplyMovementForce(forceGuid, player->GetPosition(), horizontalSpeed, MovementForceType::SingleDirectional, direction);
+    SkyridingMovementForces.push_back({ player->GetGUID(), forceGuid, SkyridingImpulseMovementForceDurationMs });
 }
 
-bool ShouldSendSkyridingImpulse(Player const* player, char const* spellName, float horizontalSpeed, float verticalSpeed)
+void SendSkyridingVerticalLift(Player* player, float verticalSpeed)
+{
+    if (verticalSpeed <= 0.0f)
+        return;
+
+    TC_LOG_INFO("server", "Skyriding: vertical-lift player={} guid={} verticalSpeed={}",
+        player->GetName(), player->GetGUID().ToString(), verticalSpeed);
+
+    player->KnockbackFrom(player->GetPosition(), 0.0f, verticalSpeed, 0.0f);
+}
+
+void SendSkyridingAdvFlyingAddImpulse(Player* player, float horizontalSpeed, float verticalSpeed, char const* source)
 {
     if (!IsPlayerAdvFlying(player))
-        return true;
+        return;
 
-    MovementInfo::AdvFlying const& advFlying = *player->m_movementInfo.advFlying;
-    float const forwardVelocity = std::fabs(advFlying.forwardVelocity);
-    float const upVelocity = advFlying.upVelocity;
+    RemoveSkyridingMovementForces(player);
 
-    if (horizontalSpeed > 0.0f && forwardVelocity >= horizontalSpeed)
+    float const unitOrientation = player->GetOrientation();
+    float const movementOrientation = player->m_movementInfo.pos.GetOrientation();
+    float const orientation = std::isfinite(movementOrientation) ? movementOrientation : unitOrientation;
+    float const pitch = GetCurrentMovementPitch(player);
+    float const pitchCos = std::max(std::cos(pitch), 0.0f);
+    float const directionX = std::cos(orientation) * horizontalSpeed * pitchCos;
+    float const directionY = std::sin(orientation) * horizontalSpeed * pitchCos;
+    float const directionZ = verticalSpeed;
+    uint32 const sequenceIndex = player->GetAndIncrementMovementCounter();
+
+    TC_LOG_INFO("server", "Skyriding: add-impulse player={} guid={} source={} sequenceIndex={} currentForwardVelocity={} currentUpVelocity={} horizontalSpeed={} verticalSpeed={} unitOrientation={} movementOrientation={} usedOrientation={} pitch={} directionX={} directionY={} directionZ={}",
+        player->GetName(), player->GetGUID().ToString(), source, sequenceIndex,
+        player->m_movementInfo.advFlying->forwardVelocity, player->m_movementInfo.advFlying->upVelocity,
+        horizontalSpeed, verticalSpeed, unitOrientation, movementOrientation, orientation, pitch, directionX, directionY, directionZ);
+
+    WorldPackets::Movement::MoveAddImpulse packet;
+    packet.MoverGUID = player->GetGUID();
+    packet.SequenceIndex = sequenceIndex;
+    packet.Direction = TaggedPosition<Position::XYZ>(directionX, directionY, directionZ);
+    player->SendDirectMessage(packet.Write());
+}
+
+void SendSkyridingImpulse(Player* player, float horizontalSpeed, float verticalSpeed, char const* source)
+{
+    if (IsPlayerAdvFlying(player))
     {
-        TC_LOG_INFO("server", "Skyriding: impulse-skip-preserve-forward player={} guid={} spell={} forwardVelocity={} requestedHorizontalSpeed={} upVelocity={}",
-            player->GetName(), player->GetGUID().ToString(), spellName, forwardVelocity, horizontalSpeed, upVelocity);
-        return false;
+        SendSkyridingAdvFlyingAddImpulse(player, horizontalSpeed, verticalSpeed, source);
     }
-
-    if (verticalSpeed > 0.0f && upVelocity >= verticalSpeed)
+    else
     {
-        TC_LOG_INFO("server", "Skyriding: impulse-skip-preserve-up player={} guid={} spell={} forwardVelocity={} upVelocity={} requestedVerticalSpeed={}",
-            player->GetName(), player->GetGUID().ToString(), spellName, forwardVelocity, upVelocity, verticalSpeed);
-        return false;
+        SendSkyridingHorizontalMovementForce(player, horizontalSpeed, source);
+        SendSkyridingVerticalLift(player, verticalSpeed);
     }
+}
 
-    return true;
+void SendSkyridingPreservedForwardImpulse(Player* player, char const* spellName, float horizontalBonus, float verticalBonus)
+{
+    float const currentForwardSpeed = GetCurrentAdvFlyingForwardSpeed(player);
+    float const currentUpVelocity = GetCurrentAdvFlyingUpVelocity(player);
+    float const pitch = GetCurrentMovementPitch(player);
+    float const pitchVerticalBonus = verticalBonus <= 0.0f ? horizontalBonus * std::sin(pitch) * SkyridingPitchVerticalVelocityScale : 0.0f;
+    float const verticalImpulse = verticalBonus > 0.0f ? verticalBonus : pitchVerticalBonus;
+
+    TC_LOG_INFO("server", "Skyriding: impulse-preserve player={} guid={} spell={} currentForwardSpeed={} currentUpVelocity={} pitch={} horizontalBonus={} verticalBonus={} pitchVerticalBonus={} impulseHorizontal={} impulseVertical={}",
+        player->GetName(), player->GetGUID().ToString(), spellName, currentForwardSpeed, currentUpVelocity, pitch, horizontalBonus, verticalBonus, pitchVerticalBonus, horizontalBonus, verticalImpulse);
+
+    SendSkyridingImpulse(player, horizontalBonus, verticalImpulse, spellName);
 }
 
 void SendSkyridingForwardImpulse(Player* player, char const* spellName, float horizontalSpeed, float verticalSpeed)
 {
     LogSkyridingState(player, "active-spell-impulse", spellName);
-    if (!ShouldSendSkyridingImpulse(player, spellName, horizontalSpeed, verticalSpeed))
-        return;
-
-    SendSkyridingImpulse(player, horizontalSpeed, verticalSpeed);
+    SendSkyridingPreservedForwardImpulse(player, spellName, horizontalSpeed, verticalSpeed);
 }
 
 void SendSkyridingAscentImpulse(Player* player, char const* spellName, float horizontalSpeed, float groundVerticalSpeed, float flyingVerticalSpeed)
@@ -357,44 +477,17 @@ void SendSkyridingAscentImpulse(Player* player, char const* spellName, float hor
 
     if (!IsPlayerAdvFlying(player))
     {
-        SendSkyridingImpulse(player, horizontalSpeed, groundVerticalSpeed);
+        SendSkyridingImpulse(player, horizontalSpeed, groundVerticalSpeed, spellName);
         return;
     }
 
-    MovementInfo::AdvFlying const& advFlying = *player->m_movementInfo.advFlying;
-    float const forwardVelocity = std::fabs(advFlying.forwardVelocity);
-    float const upVelocity = advFlying.upVelocity;
-
-    if (upVelocity >= flyingVerticalSpeed)
-    {
-        TC_LOG_INFO("server", "Skyriding: impulse-skip-preserve-up player={} guid={} spell={} forwardVelocity={} upVelocity={} requestedVerticalSpeed={}",
-            player->GetName(), player->GetGUID().ToString(), spellName, forwardVelocity, upVelocity, flyingVerticalSpeed);
-        return;
-    }
-
-    SendSkyridingImpulse(player, std::max(forwardVelocity, horizontalSpeed), flyingVerticalSpeed);
+    SendSkyridingPreservedForwardImpulse(player, spellName, horizontalSpeed, flyingVerticalSpeed);
 }
 
 void SendSkyridingWhirlingImpulse(Player* player, char const* spellName, float horizontalSpeed, float verticalSpeed)
 {
     LogSkyridingState(player, "active-spell-impulse", spellName);
-
-    if (IsPlayerAdvFlying(player))
-    {
-        MovementInfo::AdvFlying const& advFlying = *player->m_movementInfo.advFlying;
-        float const forwardVelocity = std::fabs(advFlying.forwardVelocity);
-        if (forwardVelocity >= SkyridingMovingForwardVelocity)
-        {
-            TC_LOG_INFO("server", "Skyriding: impulse-skip-preserve-whirling player={} guid={} spell={} forwardVelocity={} requestedHorizontalSpeed={} upVelocity={}",
-                player->GetName(), player->GetGUID().ToString(), spellName, forwardVelocity, horizontalSpeed, advFlying.upVelocity);
-            return;
-        }
-    }
-
-    if (!ShouldSendSkyridingImpulse(player, spellName, horizontalSpeed, verticalSpeed))
-        return;
-
-    SendSkyridingImpulse(player, horizontalSpeed, verticalSpeed);
+    SendSkyridingPreservedForwardImpulse(player, spellName, horizontalSpeed, verticalSpeed);
 }
 
 void SendSkyridingAirBrake(Player* player)
@@ -405,6 +498,28 @@ void SendSkyridingAirBrake(Player* player)
     Position origin = player->GetPosition();
     origin.Relocate(origin.GetPositionX() + std::cos(orientation), origin.GetPositionY() + std::sin(orientation), origin.GetPositionZ(), orientation);
     player->KnockbackFrom(origin, 6.0f, 1.0f);
+}
+
+void UpdateSkyridingMovementForces(uint32 diff)
+{
+    for (auto itr = SkyridingMovementForces.begin(); itr != SkyridingMovementForces.end();)
+    {
+        if (itr->RemainingMs > diff)
+        {
+            itr->RemainingMs -= diff;
+            ++itr;
+            continue;
+        }
+
+        if (Player* player = ObjectAccessor::FindConnectedPlayer(itr->PlayerGuid))
+        {
+            TC_LOG_INFO("server", "Skyriding: movement-force-remove player={} guid={} forceGuid={}",
+                player->GetName(), player->GetGUID().ToString(), itr->ForceGuid.ToString());
+            player->RemoveMovementForce(itr->ForceGuid);
+        }
+
+        itr = SkyridingMovementForces.erase(itr);
+    }
 }
 }
 
@@ -484,7 +599,7 @@ private:
         if (!player)
             return SPELL_FAILED_BAD_TARGETS;
 
-        return CheckCanUseSkyriding(player);
+        return CheckCanUseSkyriding(player, _kind == ImpulseKind::Ascent);
     }
 
     void Launch()
@@ -614,6 +729,7 @@ public:
     void OnLogout(Player* player) override
     {
         LogSkyridingState(player, "logout-cleanup");
+        RemoveSkyridingMovementForces(player);
         DisableSkyriding(player, false, true);
     }
 
@@ -631,6 +747,8 @@ public:
 
     void OnUpdate(uint32 diff) override
     {
+        UpdateSkyridingMovementForces(diff);
+
         if (_timer <= diff)
         {
             _timer = SkyridingCleanupIntervalMs;
@@ -689,10 +807,10 @@ private:
 void AddSC_skyriding_spell_scripts()
 {
     RegisterSpellScript(spell_skyriding_toggle);
-    RegisterSpellScriptWithArgs(spell_skyriding_impulse, "spell_skyriding_forward_surge", "forward-surge", 96.0f, 0.0f, spell_skyriding_impulse::ImpulseKind::Forward);
+    RegisterSpellScriptWithArgs(spell_skyriding_impulse, "spell_skyriding_forward_surge", "forward-surge", SkyridingForwardSurgeSpeedBonus, 0.0f, spell_skyriding_impulse::ImpulseKind::Forward);
     RegisterSpellScriptWithArgs(spell_skyriding_impulse, "spell_skyriding_skyward_ascent", "skyward-ascent", SkyridingAscentGroundHorizontalSpeed, SkyridingAscentGroundVerticalSpeed, spell_skyriding_impulse::ImpulseKind::Ascent);
     RegisterSpellScriptWithArgs(spell_skyriding_impulse, "spell_skyriding_keybound_ascent", "keybound-ascent", SkyridingAscentGroundHorizontalSpeed, SkyridingAscentGroundVerticalSpeed, spell_skyriding_impulse::ImpulseKind::Ascent);
-    RegisterSpellScriptWithArgs(spell_skyriding_impulse, "spell_skyriding_whirling_surge", "whirling-surge", 220.0f, 0.0f, spell_skyriding_impulse::ImpulseKind::Whirling);
+    RegisterSpellScriptWithArgs(spell_skyriding_impulse, "spell_skyriding_whirling_surge", "whirling-surge", SkyridingWhirlingSurgeSpeedBonus, 0.0f, spell_skyriding_impulse::ImpulseKind::Whirling);
     RegisterSpellScript(spell_skyriding_aerial_stop);
     RegisterSpellScript(spell_skyriding_second_wind);
     new skyriding_player_cleanup();

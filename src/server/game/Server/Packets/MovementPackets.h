@@ -757,6 +757,18 @@ namespace WorldPackets
             uint32 Ticks = 0;
         };
 
+        class MoveAddImpulse final : public ServerPacket
+        {
+        public:
+            explicit MoveAddImpulse() : ServerPacket(SMSG_MOVE_ADD_IMPULSE, 16 + 4 + 12) { }
+
+            WorldPacket const* Write() override;
+
+            ObjectGuid MoverGUID;
+            uint32 SequenceIndex = 0;
+            TaggedPosition<Position::XYZ> Direction;
+        };
+
         ByteBuffer& operator>>(ByteBuffer& data, MovementAck& ack);
     }
 }

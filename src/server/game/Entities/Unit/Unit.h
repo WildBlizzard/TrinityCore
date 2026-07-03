@@ -1715,6 +1715,7 @@ class TC_GAME_API Unit : public WorldObject
         float GetAdvFlyingSpeedMax(AdvFlyingRateTypeRange speedType) const { return m_advFlyingSpeed[speedType + 1]; }
         void UpdateAdvFlyingSpeed(AdvFlyingRateTypeSingle speedType, bool clientUpdate);
         void UpdateAdvFlyingSpeed(AdvFlyingRateTypeRange speedType, bool clientUpdate);
+        uint32 GetAndIncrementMovementCounter() { return m_movementCounter++; }
 
         void FollowerAdded(AbstractFollower* f);
         void FollowerRemoved(AbstractFollower* f);
