@@ -685,9 +685,10 @@ class spell_skyriding_second_wind : public SpellScript
             if (!spellInfo)
                 continue;
 
-            player->GetSpellHistory()->ResetCooldown(spellId, true);
-            if (spellInfo->ChargeCategoryId)
-                player->GetSpellHistory()->RestoreCharge(spellInfo->ChargeCategoryId);
+            // Second Wind's DB2 effect already restores the skyriding charge category once.
+            // This script only bridges skyriding buttons implemented as ordinary cooldowns.
+            if (!spellInfo->ChargeCategoryId)
+                player->GetSpellHistory()->ResetCooldown(spellId, true);
         }
     }
 
