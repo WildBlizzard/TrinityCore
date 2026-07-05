@@ -62,7 +62,7 @@ constexpr uint32 SkyridingFlightCapabilityId = 1;
 constexpr uint32 SkyridingCleanupIntervalMs = 1000;
 constexpr float SkyridingAscentGroundHorizontalSpeed = 28.0f;
 constexpr float SkyridingAscentGroundVerticalSpeed = 58.0f;
-constexpr float SkyridingAscentFlyingVerticalSpeed = 44.0f;
+constexpr float SkyridingAscentFlyingVerticalSpeed = 52.0f;
 constexpr float SkyridingForwardSurgeSpeedBonus = 36.0f;
 constexpr float SkyridingWhirlingSurgeSpeedBonus = 64.0f;
 constexpr float SkyridingPitchVerticalVelocityScale = 0.55f;
@@ -363,6 +363,20 @@ float GetCurrentMovementPitch(Player const* player)
     return std::isfinite(pitch) ? pitch : 0.0f;
 }
 
+float GetCurrentMovementOrientation(Player const* player)
+{
+    float const unitOrientation = player->GetOrientation();
+    float const movementOrientation = player->m_movementInfo.pos.GetOrientation();
+    return std::isfinite(movementOrientation) ? movementOrientation : unitOrientation;
+}
+
+float GetCurrentFacingOrientation(Player const* player)
+{
+    float const unitOrientation = player->GetOrientation();
+    float const movementOrientation = player->m_movementInfo.pos.GetOrientation();
+    return std::isfinite(unitOrientation) ? unitOrientation : movementOrientation;
+}
+
 void SendSkyridingKnockbackImpulse(Player* player, float horizontalSpeed, float verticalSpeed)
 {
     float const unitOrientation = player->GetOrientation();
@@ -376,11 +390,10 @@ void SendSkyridingKnockbackImpulse(Player* player, float horizontalSpeed, float 
     player->KnockbackFrom(player->GetPosition(), horizontalSpeed, verticalSpeed, angle);
 }
 
-void SendSkyridingHorizontalMovementForce(Player* player, float horizontalSpeed, char const* source)
+void SendSkyridingHorizontalMovementForce(Player* player, float horizontalSpeed, char const* source, float orientation, char const* orientationSource)
 {
     float const unitOrientation = player->GetOrientation();
     float const movementOrientation = player->m_movementInfo.pos.GetOrientation();
-    float const orientation = std::isfinite(movementOrientation) ? movementOrientation : unitOrientation;
 
     if (horizontalSpeed <= 0.0f)
         return;
@@ -390,8 +403,8 @@ void SendSkyridingHorizontalMovementForce(Player* player, float horizontalSpeed,
     Position direction(std::cos(orientation), std::sin(orientation), 0.0f);
     ObjectGuid const forceGuid = AreaTrigger::CreateNewMovementForceId(player->GetMap(), 0);
 
-    TC_LOG_INFO("server", "Skyriding: movement-force player={} guid={} forceGuid={} source={} horizontalSpeed={} magnitude={} unitOrientation={} movementOrientation={} usedOrientation={} directionX={} directionY={} directionZ={} durationMs={}",
-        player->GetName(), player->GetGUID().ToString(), forceGuid.ToString(), source, horizontalSpeed, horizontalSpeed, unitOrientation, movementOrientation, orientation,
+    TC_LOG_INFO("server", "Skyriding: movement-force player={} guid={} forceGuid={} source={} orientationSource={} horizontalSpeed={} magnitude={} unitOrientation={} movementOrientation={} usedOrientation={} directionX={} directionY={} directionZ={} durationMs={}",
+        player->GetName(), player->GetGUID().ToString(), forceGuid.ToString(), source, orientationSource, horizontalSpeed, horizontalSpeed, unitOrientation, movementOrientation, orientation,
         direction.GetPositionX(), direction.GetPositionY(), direction.GetPositionZ(), SkyridingImpulseMovementForceDurationMs);
 
     player->ApplyMovementForce(forceGuid, player->GetPosition(), horizontalSpeed, MovementForceType::SingleDirectional, direction);
@@ -438,6 +451,29 @@ void SendSkyridingAdvFlyingAddImpulse(Player* player, float horizontalSpeed, flo
     player->SendDirectMessage(packet.Write());
 }
 
+void SendSkyridingTakeoffAddImpulse(Player* player, float horizontalSpeed, float verticalSpeed, char const* source)
+{
+    RemoveSkyridingMovementForces(player);
+
+    float const unitOrientation = player->GetOrientation();
+    float const movementOrientation = player->m_movementInfo.pos.GetOrientation();
+    float const orientation = GetCurrentFacingOrientation(player);
+    float const directionX = std::cos(orientation) * horizontalSpeed;
+    float const directionY = std::sin(orientation) * horizontalSpeed;
+    float const directionZ = verticalSpeed;
+    uint32 const sequenceIndex = player->GetAndIncrementMovementCounter();
+
+    TC_LOG_INFO("server", "Skyriding: takeoff-add-impulse player={} guid={} source={} sequenceIndex={} horizontalSpeed={} verticalSpeed={} unitOrientation={} movementOrientation={} usedOrientation={} directionX={} directionY={} directionZ={}",
+        player->GetName(), player->GetGUID().ToString(), source, sequenceIndex,
+        horizontalSpeed, verticalSpeed, unitOrientation, movementOrientation, orientation, directionX, directionY, directionZ);
+
+    WorldPackets::Movement::MoveAddImpulse packet;
+    packet.MoverGUID = player->GetGUID();
+    packet.SequenceIndex = sequenceIndex;
+    packet.Direction = TaggedPosition<Position::XYZ>(directionX, directionY, directionZ);
+    player->SendDirectMessage(packet.Write());
+}
+
 void SendSkyridingImpulse(Player* player, float horizontalSpeed, float verticalSpeed, char const* source)
 {
     if (IsPlayerAdvFlying(player))
@@ -446,9 +482,14 @@ void SendSkyridingImpulse(Player* player, float horizontalSpeed, float verticalS
     }
     else
     {
-        SendSkyridingHorizontalMovementForce(player, horizontalSpeed, source);
+        SendSkyridingHorizontalMovementForce(player, horizontalSpeed, source, GetCurrentMovementOrientation(player), "movement");
         SendSkyridingVerticalLift(player, verticalSpeed);
     }
+}
+
+void SendSkyridingTakeoffImpulse(Player* player, float horizontalSpeed, float verticalSpeed, char const* source)
+{
+    SendSkyridingTakeoffAddImpulse(player, horizontalSpeed, verticalSpeed, source);
 }
 
 void SendSkyridingPreservedForwardImpulse(Player* player, char const* spellName, float horizontalBonus, float verticalBonus)
@@ -477,7 +518,7 @@ void SendSkyridingAscentImpulse(Player* player, char const* spellName, float hor
 
     if (!IsPlayerAdvFlying(player))
     {
-        SendSkyridingImpulse(player, horizontalSpeed, groundVerticalSpeed, spellName);
+        SendSkyridingTakeoffImpulse(player, horizontalSpeed, groundVerticalSpeed, spellName);
         return;
     }
 
