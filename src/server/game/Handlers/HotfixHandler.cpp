@@ -27,21 +27,11 @@ namespace
 constexpr int32 SkyridingOverrideRecordId = 2106;
 constexpr int32 SkyridingOverrideSourceRecordId = 2106;
 constexpr int32 SkyridingOverrideHotfixPushId = 108362;
-constexpr uint32 SkyridingOverrideHotfixUniqueId = 4282830033;
 constexpr uint32 SkyridingOverrideSpellDataTableHash = 3396722460;
 
 bool IsSkyridingOverrideHotfix(DB2Manager::HotfixRecord const& hotfixRecord)
 {
     return hotfixRecord.RecordID == SkyridingOverrideRecordId || hotfixRecord.ID.PushID == SkyridingOverrideHotfixPushId;
-}
-
-bool HasSkyridingOverrideHotfix(DB2Manager::HotfixPush const& push)
-{
-    for (DB2Manager::HotfixRecord const& hotfixRecord : push.Records)
-        if (IsSkyridingOverrideHotfix(hotfixRecord))
-            return true;
-
-    return false;
 }
 
 bool TryWriteSkyridingOverrideBlob(uint32 tableHash, int32 recordId, LocaleConstant locale, ByteBuffer& data, uint32& size)
@@ -68,11 +58,6 @@ void WorldSession::HandleDBQueryBulk(WorldPackets::Hotfix::DBQueryBulk& dbQuery)
         WorldPackets::Hotfix::DBReply dbReply;
         dbReply.TableHash = dbQuery.TableHash;
         dbReply.RecordID = record.RecordID;
-
-        if (record.RecordID == SkyridingOverrideRecordId)
-            TC_LOG_INFO("server", "SkyridingHotfix: db-query-bulk player={} tableHash={} recordId={} sourceRecordId={} hasStore={} hasRecord={} hasSourceRecord={}",
-                GetPlayerInfo(), dbQuery.TableHash, record.RecordID, SkyridingOverrideSourceRecordId,
-                store != nullptr, store && store->HasRecord(record.RecordID), store && store->HasRecord(SkyridingOverrideSourceRecordId));
 
         uint32 skyridingBlobSize = 0;
         if (TryWriteSkyridingOverrideBlob(dbQuery.TableHash, record.RecordID, GetSessionDbcLocale(), dbReply.Data, skyridingBlobSize))
@@ -118,9 +103,6 @@ void WorldSession::SendAvailableHotfixes()
 
         availableHotfixes.Hotfixes.insert(push.Records.front().ID);
 
-        if (HasSkyridingOverrideHotfix(push))
-            TC_LOG_INFO("server", "SkyridingHotfix: available player={} locale={} advertisedPushId={} advertisedUniqueId={} records={}",
-                GetPlayerInfo(), uint32(GetSessionDbcLocale()), push.Records.front().ID.PushID, push.Records.front().ID.UniqueID, push.Records.size());
     }
 
     SendPacket(availableHotfixes.Write());
@@ -133,10 +115,6 @@ void WorldSession::HandleHotfixRequest(WorldPackets::Hotfix::HotfixRequest& hotf
     hotfixQueryResponse.Hotfixes.reserve(hotfixQuery.Hotfixes.size());
     for (int32 hotfixId : hotfixQuery.Hotfixes)
     {
-        if (hotfixId == SkyridingOverrideHotfixPushId)
-            TC_LOG_INFO("server", "SkyridingHotfix: request player={} pushId={} expectedUniqueId={}",
-                GetPlayerInfo(), hotfixId, SkyridingOverrideHotfixUniqueId);
-
         if (DB2Manager::HotfixPush const* hotfixRecords = Trinity::Containers::MapGetValuePtr(hotfixes, hotfixId))
         {
             for (DB2Manager::HotfixRecord const& hotfixRecord : hotfixRecords->Records)
@@ -182,13 +160,6 @@ void WorldSession::HandleHotfixRequest(WorldPackets::Hotfix::HotfixRequest& hotf
                             hotfixData.Record.HotfixStatus = storage ? DB2Manager::HotfixRecord::Status::RecordRemoved : DB2Manager::HotfixRecord::Status::Invalid;
                     }
                 }
-
-                if (IsSkyridingOverrideHotfix(hotfixRecord))
-                    TC_LOG_INFO("server", "SkyridingHotfix: response-record player={} pushId={} uniqueId={} tableHash={} recordId={} sourceRecordId={} status={} size={} finalStatus={} hasStorage={} hasSourceRecord={}",
-                        GetPlayerInfo(), hotfixRecord.ID.PushID, hotfixRecord.ID.UniqueID, hotfixRecord.TableHash, hotfixRecord.RecordID,
-                        SkyridingOverrideSourceRecordId, uint32(hotfixRecord.HotfixStatus), hotfixData.Size, uint32(hotfixData.Record.HotfixStatus),
-                        sDB2Manager.GetStorage(hotfixRecord.TableHash) != nullptr,
-                        sDB2Manager.GetStorage(hotfixRecord.TableHash) && sDB2Manager.GetStorage(hotfixRecord.TableHash)->HasRecord(SkyridingOverrideSourceRecordId));
             }
         }
     }
