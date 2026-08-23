@@ -85,12 +85,12 @@ std::unordered_set<ObjectGuid> SkyridingPreferredPlayers;
 
 bool IsSkyridingEnabled(Player const* player)
 {
-    return player->HasExtraUnitMovementFlag2(MOVEMENTFLAG3_CAN_ADV_FLY);
+    return player->HasUnitMovementFlag(MOVEMENTFLAG_CAN_ADV_FLY);
 }
 
 bool IsPlayerAdvFlying(Player const* player)
 {
-    return player->HasExtraUnitMovementFlag2(MOVEMENTFLAG3_ADV_FLYING) && player->m_movementInfo.advFlying.has_value();
+    return player->HasUnitMovementFlag(MOVEMENTFLAG_ADV_FLYING) && player->m_movementInfo.advFlying.has_value();
 }
 
 bool IsSkyridingPreferred(Player const* player)
